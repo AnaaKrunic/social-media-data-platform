@@ -1,0 +1,34 @@
+# Python virtual environments and generated Python files
+.venv/
+venv/
+ENV/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Test, type-checker, linter, and coverage output
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# CDK generated assets and synthesized CloudFormation output
+.cdk.staging/
+cdk.out/
+
+# Local secrets and AWS key material - commit only safe example files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Editor and operating-system files
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
