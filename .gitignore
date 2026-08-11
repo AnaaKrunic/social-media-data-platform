@@ -27,6 +27,11 @@ cdk.out/
 *.pem
 *.key
 
+# Large Bronze-layer datasets (upload to S3, do not commit)
+data/bronze/**/*.csv
+data/bronze/**/*.zip
+data/local_test_output/
+
 # Editor and operating-system files
 .vscode/
 *.swp

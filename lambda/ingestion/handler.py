@@ -49,6 +49,7 @@ def _fetch_page(content_type: str, page: int, start_epoch: int, end_epoch: int) 
 
 def handler(event, context):
     bucket_name = os.environ["RAW_BUCKET_NAME"]
+    max_pages = int(os.environ.get("HN_MAX_PAGES", "9999"))
     start, end = _previous_utc_day(datetime.now(timezone.utc))
     start_epoch = int(start.timestamp())
     end_epoch = int(end.timestamp())
@@ -75,11 +76,14 @@ def handler(event, context):
 
             if page >= response_metadata["nbPages"] - 1:
                 break
+            if page >= max_pages - 1:
+                break
             page += 1
 
     return {
         "source": "hackernews",
         "date": start.strftime("%Y-%m-%d"),
+        "max_pages_per_type": max_pages,
         "objects_written": objects_written,
         "event_id": event.get("id"),
         "request_id": context.aws_request_id,
