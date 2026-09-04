@@ -6,7 +6,9 @@ import aws_cdk as cdk
 from social_media_data_platform.social_media_data_platform_stack import SocialMediaDataPlatformStack
 
 
-app = cdk.App()
+# SAFE_CDK_OUTDIR is useful for generating a fresh, separately inspectable
+# template without trusting a stale cdk.out directory.
+app = cdk.App(outdir=os.getenv("SAFE_CDK_OUTDIR"))
 SocialMediaDataPlatformStack(app, "SocialMediaDataPlatformStack",
     # If you don't specify 'env', this stack will be environment-agnostic.
     # Account/Region-dependent features and context lookups will not work,
