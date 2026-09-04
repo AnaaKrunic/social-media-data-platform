@@ -1,172 +1,182 @@
-"""Silver layer normalization Lambda.
+"""Publish immutable Silver snapshots; commit a pointer only after all writes.
 
-Reads Bronze data from S3, normalizes it, and writes Parquet datasets:
-  - silver/users/   partitioned by platform
-  - silver/posts/   partitioned by year/month/day
+Re-running a source/date replaces its pointer, not other dates or platforms.
+Only committed snapshots are consumed by Gold. Legacy silver/ data is ignored.
 """
-
-from __future__ import annotations
-
+import json
 import os
+import uuid
+import codecs
+import csv
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 import awswrangler as wr
 import boto3
 import pandas as pd
-
-from hackernews import content_type_from_key, parse_hn_bronze_object
+from hackernews import normalize_official
 from x_bitcoin import normalize_bitcoin_chunk
 
-s3_client = boto3.client("s3")
-
-BITCOIN_AWS_FILE = "Bitcoin_tweets_aws.csv"
-CSV_CHUNK_SIZE = 25_000
-
-
-def _bitcoin_files() -> tuple[str, ...]:
-    return (BITCOIN_AWS_FILE,)
-
-
-def _max_bitcoin_chunks() -> int | None:
-    return None
+MAX_X_ROWS = 500_000  # fail explicitly rather than truncate; choose a bounded source file
+csv.field_size_limit(2_147_483_647)
+USER_TYPES = {"user_id": "string", "username": "string", "platform": "string",
+              "karma_score": "Int64", "followers_count": "Int64", "is_verified": "boolean"}
+POST_TYPES = {"post_id": "string", "platform": "string", "author_id": "string",
+              "content_text": "string", "post_type": "string", "score": "Int64", "parent_id": "string",
+              "year": "string", "month": "string", "day": "string"}
 
 
-def _previous_utc_day() -> str:
-    day = datetime.now(timezone.utc).date() - timedelta(days=1)
-    return day.strftime("%Y-%m-%d")
+def keys(s3, bucket, prefix):
+    return [o["Key"] for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix)
+            for o in page.get("Contents", [])]
 
 
-def _dedupe_users(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-    return df.sort_values("created_at").drop_duplicates(subset=["user_id"], keep="last")
+def read_json(s3, bucket, key):
+    return json.loads(s3.get_object(Bucket=bucket, Key=key)["Body"].read())
 
 
-def _dedupe_posts(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-    return df.drop_duplicates(subset=["post_id"], keep="last")
+def typed(df, types):
+    df = df.copy()
+    for col, dtype in types.items():
+        if col not in df:
+            df[col] = pd.Series(index=df.index, dtype=dtype)
+        if dtype == "Int64":
+            values = pd.to_numeric(df[col], errors="coerce")
+            df[col] = values.where(values.isna() | (values % 1 == 0)).astype(dtype)
+        else:
+            df[col] = df[col].astype(dtype)
+    df["created_at"] = pd.to_datetime(df.get("created_at"), utc=True, errors="coerce")
+    return df
 
 
-def _write_users(bucket: str, users_df: pd.DataFrame, *, mode: str) -> int:
-    users_df = _dedupe_users(users_df)
-    if users_df.empty:
-        return 0
-
-    wr.s3.to_parquet(
-        df=users_df,
-        path=f"s3://{bucket}/silver/users/",
-        dataset=True,
-        partition_cols=["platform"],
-        mode=mode,
-        compression="snappy",
-    )
-    return len(users_df)
-
-
-def _write_posts(bucket: str, posts_df: pd.DataFrame, *, mode: str) -> int:
-    posts_df = _dedupe_posts(posts_df)
-    if posts_df.empty:
-        return 0
-
-    posts_df = posts_df.dropna(subset=["year", "month", "day"])
-    wr.s3.to_parquet(
-        df=posts_df,
-        path=f"s3://{bucket}/silver/posts/",
-        dataset=True,
-        partition_cols=["year", "month", "day"],
-        mode=mode,
-        compression="snappy",
-    )
-    return len(posts_df)
+def clean(users, posts):
+    users = typed(users, USER_TYPES)
+    if "observed_at" in users:
+        users = users.sort_values("observed_at", na_position="first")
+    users = users.drop_duplicates("user_id", keep="last")
+    posts = typed(posts, POST_TYPES).drop_duplicates(["platform", "post_id"], keep="last")
+    # A real FK instead of username joins; no redundant username/kids lists in posts.
+    posts = posts.drop(columns=["author_username", "kids"], errors="ignore")
+    invalid = posts["created_at"].isna() | posts["post_id"].isna()
+    rejects = posts[invalid].copy()
+    posts = posts[~invalid].copy()
+    if not posts["author_id"].dropna().isin(users["user_id"]).all():
+        raise ValueError("Post author_id is not present in users")
+    return users, posts, rejects
 
 
-def _list_keys(bucket: str, prefix: str) -> list[str]:
-    keys: list[str] = []
-    paginator = s3_client.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        for item in page.get("Contents", []):
-            keys.append(item["Key"])
-    return keys
-
-
-def normalize_hackernews(bucket: str, date: str) -> dict:
-    prefix = f"bronze/hackernews/date={date}/"
-    keys = [key for key in _list_keys(bucket, prefix) if key.endswith(".json")]
-
-    all_users: list[pd.DataFrame] = []
-    all_posts: list[pd.DataFrame] = []
-
-    for key in keys:
-        content_type = content_type_from_key(key)
-        if not content_type:
+def publish(s3, bucket, source, date, users, posts, edges, input_rows, malformed_rows=0):
+    users, posts, rejects = clean(users, posts)
+    prefix = f"silver/runs/{uuid.uuid4().hex}"
+    tables = {}
+    for name, df, partitions in (
+        ("users", users, ["platform"]),
+        ("posts", posts, ["platform", "year", "month", "day"]),
+        ("post_relations", edges.drop_duplicates(), ["platform"]),
+    ):
+        if df.empty:
+            tables[name] = None
             continue
+        dataset_path = f"s3://{bucket}/{prefix}/{name}/"
+        wr.s3.to_parquet(df=df, path=dataset_path, dataset=True,
+                         partition_cols=partitions, mode="append",
+                         compression="snappy")
+        # With dataset=True, awswrangler must read a single dataset root in
+        # order to discover partition columns. A list of object paths is valid
+        # only for non-dataset reads.
+        tables[name] = dataset_path
+    if not rejects.empty:
+        wr.s3.to_parquet(df=rejects, path=f"s3://{bucket}/{prefix}/rejected.parquet")
+    manifest = {"source": source, "date": date, "tables": tables, "status": "complete",
+                "input_rows": input_rows, "users": len(users), "posts": len(posts),
+                "rejected_posts": len(rejects), "malformed_input_rows": malformed_rows,
+                "committed_at": datetime.now(timezone.utc).isoformat()}
+    s3.put_object(Bucket=bucket, Key=f"control/silver/{source}/{date}.json",
+                  Body=json.dumps(manifest).encode(), ContentType="application/json")
+    return manifest
 
-        response = s3_client.get_object(Bucket=bucket, Key=key)
-        raw_bytes = response["Body"].read()
-        users_df, posts_df = parse_hn_bronze_object(raw_bytes, content_type)
-        all_users.append(users_df)
-        all_posts.append(posts_df)
 
-    users = pd.concat(all_users, ignore_index=True) if all_users else pd.DataFrame()
-    posts = pd.concat(all_posts, ignore_index=True) if all_posts else pd.DataFrame()
+def normalize_hackernews(bucket, date):
+    s3 = boto3.client("s3")
+    manifest = read_json(s3, bucket, f"control/bronze/hackernews/{date}.json")
+    if manifest.get("status") != "complete":
+        raise ValueError("Bronze run is not complete")
+    prefix = manifest["prefix"]
+    item_keys = keys(s3, bucket, prefix + "/items/")
+    user_keys = keys(s3, bucket, prefix + "/users/")
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        items = list(pool.map(lambda k: read_json(s3, bucket, k), item_keys))
+        profiles = list(pool.map(lambda k: read_json(s3, bucket, k), user_keys))
+    names = {i["by"] for i in items if i.get("by")}
+    profiles_by_name = {name: {} for name in names}
+    profiles_by_name.update({p["id"]: p for p in profiles if p})
+    users, posts, edges = normalize_official(items, profiles_by_name)
+    return publish(s3, bucket, "hackernews", date, users, posts, edges, len(items))
 
-    return {
-        "source": "hackernews",
-        "date": date,
-        "bronze_objects": len(keys),
-        "users_written": _write_users(bucket, users, mode="overwrite_partitions"),
-        "posts_written": _write_posts(bucket, posts, mode="overwrite_partitions"),
-    }
 
-
-def normalize_x_bitcoin(bucket: str, chunk_size: int = CSV_CHUNK_SIZE) -> dict:
-    users_written = 0
-    posts_written = 0
-    chunks_processed = 0
-    max_chunks = _max_bitcoin_chunks()
-    files = _bitcoin_files()
-
-    for filename in files:
-        s3_path = f"s3://{bucket}/bronze/x/bitcoin/{filename}"
-        if not wr.s3.does_object_exist(s3_path):
+def csv_chunks(s3, bucket, key, chunk_size=25_000):
+    """RFC-4180 streaming reader. Yield valid rows and count malformed rows."""
+    body = s3.get_object(Bucket=bucket, Key=key)["Body"]
+    reader = csv.reader(codecs.getreader("utf-8")(body, errors="replace"))
+    header = next(reader, None)
+    if not header:
+        raise ValueError("Empty X CSV")
+    rows, invalid = [], 0
+    for row in reader:
+        if len(row) != len(header):
+            invalid += 1
             continue
+        rows.append(row)
+        if len(rows) == chunk_size:
+            yield pd.DataFrame(rows, columns=header), invalid
+            rows, invalid = [], 0
+    if rows or invalid:
+        yield pd.DataFrame(rows, columns=header), invalid
 
-        for chunk in wr.s3.read_csv(path=s3_path, chunksize=chunk_size):
-            users_df, posts_df = normalize_bitcoin_chunk(chunk)
-            users_written += _write_users(bucket, users_df, mode="append")
-            posts_written += _write_posts(bucket, posts_df, mode="append")
-            chunks_processed += 1
-            if max_chunks is not None and chunks_processed >= max_chunks:
-                break
-
-        if max_chunks is not None and chunks_processed >= max_chunks:
-            break
-
-    return {
-        "source": "x_bitcoin",
-        "files": list(files),
-        "chunks_processed": chunks_processed,
-        "chunk_limit": max_chunks,
-        "users_written": users_written,
-        "posts_written": posts_written,
-    }
+def normalize_x_bitcoin(bucket, key):
+    if not key.startswith("bronze/x/") or not key.endswith(".csv"):
+        raise ValueError("key must identify a CSV under bronze/x/")
+    users, posts, count = [], [], 0
+    malformed_rows = 0
+    s3 = boto3.client("s3")
+    for chunk, invalid in csv_chunks(s3, bucket, key):
+        malformed_rows += invalid
+        required = {"user_name", "date", "text", "user_created", "user_followers", "user_verified"}
+        if not required.issubset(chunk.columns):
+            raise ValueError(f"Missing Bitcoin columns: {sorted(required-set(chunk.columns))}")
+        count += len(chunk) + invalid
+        if count > MAX_X_ROWS:
+            raise ValueError("Source exceeds 500000 rows; use a smaller complete dataset file")
+        u, p = normalize_bitcoin_chunk(chunk)
+        users.append(u)
+        posts.append(p)
+    if not count:
+        raise ValueError("Empty X dataset")
+    # Whole-source deduplication across CSV chunks and deterministic reruns.
+    all_users = pd.concat(users, ignore_index=True)
+    all_posts = pd.concat(posts, ignore_index=True)
+    result = publish(s3, bucket, "x_bitcoin", "dataset",
+                     all_users, all_posts,
+                     pd.DataFrame(), count, malformed_rows)
+    result["dates"] = sorted(pd.to_datetime(all_posts["created_at"], utc=True, errors="coerce")
+                             .dt.strftime("%Y-%m-%d").dropna().unique().tolist())
+    return result
 
 
 def handler(event, context):
     bucket = os.environ["DATA_BUCKET_NAME"]
     source = event.get("source", "hackernews")
-
-    results = []
-
-    if source in {"all", "hackernews"}:
-        date = event.get("date") or _previous_utc_day()
-        results.append(normalize_hackernews(bucket, date))
-
-    if source in {"all", "x_bitcoin"}:
-        results.append(normalize_x_bitcoin(bucket))
-
-    return {
-        "results": results,
-        "request_id": context.aws_request_id,
-    }
+    if source == "hackernews":
+        date = event.get("date") or (datetime.now(timezone.utc).date()-timedelta(days=1)).isoformat()
+        result = normalize_hackernews(bucket, date)
+    elif source == "x_bitcoin":
+        result = normalize_x_bitcoin(bucket, event.get("key", "bronze/x/bitcoin/Bitcoin_tweets_dataset_2.csv"))
+    else:
+        raise ValueError("source must be hackernews or x_bitcoin")
+    # Avoid large path lists in workflow payloads.
+    response = {"source": source, "date": result["date"], "users": result["users"],
+                "posts": result["posts"], "rejected_posts": result["rejected_posts"],
+                "malformed_input_rows": result["malformed_input_rows"]}
+    if "dates" in result:
+        response["dates"] = result["dates"]
+    return response

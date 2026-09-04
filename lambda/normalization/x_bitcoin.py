@@ -1,70 +1,51 @@
-"""Normalize Bitcoin/X Bronze CSV rows into users/posts DataFrames."""
-
-from __future__ import annotations
-
+"""Vectorized Bitcoin/X CSV normalization for Lambda-sized datasets."""
 import hashlib
-from typing import Any
-
+import html
+import re
 import pandas as pd
+from common import make_user_id
 
-from common import make_user_id, parse_datetime_to_iso8601, partition_date_parts, strip_html
+TAGS = re.compile(r"<[^>]+>")
 
+def _timestamps(series):
+    parsed = pd.to_datetime(series, utc=True, errors="coerce", format="mixed")
+    return parsed.dt.floor("s")
 
-def _parse_bool(value: Any) -> bool | None:
-    if value is None or value == "":
-        return None
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().lower() in {"true", "1", "yes"}
+def _booleans(series):
+    mapped = series.astype("string").str.strip().str.lower().map(
+        {"true": True, "1": True, "yes": True, "false": False, "0": False, "no": False})
+    return mapped.astype("boolean")
 
-
-def _make_post_id(username: str, created_at: str | None, text: str) -> str:
-    raw = f"{username}|{created_at or ''}|{text}".encode("utf-8")
-    return "x-" + hashlib.sha256(raw).hexdigest()[:24]
-
-
-def normalize_bitcoin_chunk(chunk: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    user_rows: dict[str, dict[str, Any]] = {}
-    post_rows: list[dict[str, Any]] = []
-
-    for _, row in chunk.iterrows():
-        username = str(row.get("user_name") or "").strip()
-        if not username:
-            continue
-
-        tweet_time = parse_datetime_to_iso8601(str(row.get("date") or ""))
-        user_created = parse_datetime_to_iso8601(str(row.get("user_created") or ""))
-        year, month, day = partition_date_parts(tweet_time)
-        platform = "X"
-        is_retweet = _parse_bool(row.get("is_retweet"))
-        content_text = strip_html(str(row.get("text") or ""))
-
-        user_rows[username] = {
-            "user_id": make_user_id(platform, username),
-            "username": username,
-            "platform": platform,
-            "karma_score": None,
-            "is_verified": _parse_bool(row.get("user_verified")),
-            "followers_count": pd.to_numeric(row.get("user_followers"), errors="coerce"),
-            "created_at": user_created,
-        }
-
-        post_rows.append(
-            {
-                "post_id": _make_post_id(username, tweet_time, content_text),
-                "author_username": username,
-                "content_text": content_text,
-                "created_at": tweet_time,
-                "post_type": "retweet" if is_retweet else "tweet",
-                "score": None,
-                "parent_id": None,
-                "kids": None,
-                "year": year,
-                "month": month,
-                "day": day,
-            }
-        )
-
-    users_df = pd.DataFrame(list(user_rows.values()))
-    posts_df = pd.DataFrame(post_rows)
-    return users_df, posts_df
+def normalize_bitcoin_chunk(chunk):
+    data = chunk.copy()
+    names = data["user_name"].astype("string").str.strip()
+    valid_name = names.notna() & names.ne("")
+    data, names = data.loc[valid_name].copy(), names.loc[valid_name]
+    tweet_time = _timestamps(data["date"])
+    user_created = _timestamps(data["user_created"])
+    raw_text = data["text"].astype("string").fillna("")
+    text = raw_text.str.replace(TAGS, " ", regex=True).map(html.unescape).str.strip()
+    user_ids = names.map(lambda name: make_user_id("X", name))
+    users = pd.DataFrame({
+        "user_id": user_ids, "username": names, "platform": "X",
+        "karma_score": pd.Series(pd.NA, index=data.index, dtype="Int64"),
+        "is_verified": _booleans(data["user_verified"]),
+        "followers_count": pd.to_numeric(data["user_followers"], errors="coerce").round().astype("Int64"),
+        "created_at": user_created, "observed_at": tweet_time,
+    })
+    stable = names + "|" + tweet_time.astype("string").fillna("") + "|" + raw_text
+    generated_ids = stable.map(lambda value: "x-" + hashlib.sha256(value.encode()).hexdigest()[:24])
+    if "id" in data:
+        ids = data["id"].astype("string").where(data["id"].notna(), generated_ids)
+    else:
+        ids = generated_ids
+    posts = pd.DataFrame({
+        "post_id": ids, "platform": "X", "author_id": user_ids,
+        "author_username": names, "content_text": text, "created_at": tweet_time,
+        "post_type": _booleans(data["is_retweet"]).fillna(False).map({True: "retweet", False: "tweet"}),
+        "score": pd.Series(pd.NA, index=data.index, dtype="Int64"),
+        "parent_id": pd.Series(pd.NA, index=data.index, dtype="string"),
+        "year": tweet_time.dt.strftime("%Y"), "month": tweet_time.dt.strftime("%m"),
+        "day": tweet_time.dt.strftime("%d"),
+    })
+    return users.reset_index(drop=True), posts.reset_index(drop=True)

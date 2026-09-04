@@ -1,144 +1,95 @@
-"""Gold layer transformation Lambda.
-
-Reads Silver Parquet from S3, computes metrics/KPIs, writes Gold Parquet datasets.
-"""
-
-from __future__ import annotations
-
+"""Read committed Silver snapshots; publish a complete daily Gold manifest."""
+import json
 import os
+import uuid
 from datetime import datetime, timedelta, timezone
-
 import awswrangler as wr
+import boto3
 import pandas as pd
-
 from metrics import (
-    daily_hn_post_counts,
-    daily_users_metric,
-    data_quality_score,
-    prepare_posts,
-    top_hn_jobs,
-    top_hn_posts_by_score,
-    top_hn_users_highest_karma,
-    top_hn_users_lowest_karma,
-    top_x_users_by_followers,
+    daily_hn_post_counts, daily_users_metric, data_quality_score, prepare_posts,
+    top_hn_jobs, top_hn_posts_by_score, top_hn_users_highest_karma,
+    top_hn_users_lowest_karma, top_x_users_by_followers,
 )
 
-SILVER_USERS = "silver/users/"
-SILVER_POSTS = "silver/posts/"
 
+def dataset_root(table_location, table_name):
+    """Return a dataset prefix; accept manifests created before this fix."""
+    if isinstance(table_location, str):
+        return table_location
+    if isinstance(table_location, list) and table_location:
+        marker = f"/{table_name}/"
+        first_path = table_location[0]
+        if marker in first_path:
+            return first_path.split(marker, 1)[0] + marker
+    raise ValueError(f"Invalid Silver dataset location for {table_name}")
 
-def _previous_utc_day() -> str:
-    return (datetime.now(timezone.utc).date() - timedelta(days=1)).strftime("%Y-%m-%d")
+def read_silver(bucket, target_date):
+    s3 = boto3.client("s3")
+    manifests = []
+    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix="control/silver/"):
+        for obj in page.get("Contents", []):
+            m = json.loads(s3.get_object(Bucket=bucket, Key=obj["Key"])["Body"].read())
+            if m["source"] == "x_bitcoin" or m["date"] <= target_date:
+                manifests.append(m)
+    if not manifests:
+        raise ValueError("No committed Silver snapshots")
+    manifests.sort(key=lambda m: m["date"])
+    users, posts = [], []
+    for m in manifests:
+        if m["tables"]["users"]:
+            users.append(wr.s3.read_parquet(
+                path=dataset_root(m["tables"]["users"], "users"), dataset=True))
+        if m["tables"]["posts"] and (m["source"] == "x_bitcoin" or m["date"] == target_date):
+            posts.append(wr.s3.read_parquet(
+                path=dataset_root(m["tables"]["posts"], "posts"), dataset=True))
+    u = pd.concat(users, ignore_index=True).drop_duplicates("user_id", keep="last") if users else pd.DataFrame()
+    p = pd.concat(posts, ignore_index=True).drop_duplicates(["platform", "post_id"]) if posts else pd.DataFrame()
+    if not p.empty:
+        p = p[pd.to_datetime(p["created_at"], utc=True).dt.strftime("%Y-%m-%d") == target_date]
+    if p.empty:
+        raise ValueError(f"No posts for {target_date}; choose an actual dataset date")
+    return u, p
 
-
-def _read_silver(bucket: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    def _load(prefix: str) -> pd.DataFrame:
-        path = f"s3://{bucket}/{prefix}"
-        try:
-            df = wr.s3.read_parquet(path=path, dataset=True)
-            return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
-        except Exception:
-            return pd.DataFrame()
-
-    users = _load(SILVER_USERS)
-    posts = _load(SILVER_POSTS)
-    return users, posts
-
-
-def _write_metric(bucket: str, df: pd.DataFrame, name: str, partition_cols: list[str]) -> int:
-    if df.empty:
-        return 0
-
-    wr.s3.to_parquet(
-        df=df,
-        path=f"s3://{bucket}/gold/{name}/",
-        dataset=True,
-        partition_cols=partition_cols,
-        mode="overwrite_partitions",
-        compression="snappy",
-    )
-    return len(df)
-
-
-def transform_gold(bucket: str, target_date: str) -> dict:
-    users, posts = _read_silver(bucket)
+def transform_gold(bucket, target_date):
+    datetime.strptime(target_date, "%Y-%m-%d")
+    users, posts = read_silver(bucket, target_date)
     posts = prepare_posts(posts, users)
-
-    written: dict[str, int] = {}
-
-    # KPI: data quality
-    quality = data_quality_score(users, posts)
-    if not quality.empty:
-        quality["date"] = target_date
-        written["data_quality_score"] = _write_metric(
-            bucket, quality, "data_quality_score", ["date"]
-        )
-
-    # Daily HN post type counts
-    hn_counts = daily_hn_post_counts(posts, target_date)
-    if not hn_counts.empty:
-        hn_counts["date"] = target_date
-        written["daily_hn_post_counts"] = _write_metric(
-            bucket, hn_counts, "daily_hn_post_counts", ["date"]
-        )
-
-    # Daily users metric (spec Star Schema example)
-    users_metric = daily_users_metric(users, target_date)
-    if not users_metric.empty:
-        users_metric["date"] = target_date
-        written["daily_users_metric"] = _write_metric(
-            bucket, users_metric, "daily_users_metric", ["platform", "date"]
-        )
-
-    # Top 10 X users by followers (snapshot for date)
-    top_x = top_x_users_by_followers(users, target_date)
-    if not top_x.empty:
-        top_x["date"] = target_date
-        written["top_x_users_by_followers"] = _write_metric(
-            bucket, top_x, "top_x_users_by_followers", ["date"]
-        )
-
-    # Top 10 HN karma high / low
-    top_high = top_hn_users_highest_karma(users, posts, target_date)
-    if not top_high.empty:
-        top_high["date"] = target_date
-        top_high["ranking"] = "highest"
-        written["top_hn_users_by_karma"] = _write_metric(
-            bucket, top_high, "top_hn_users_by_karma", ["date", "ranking"]
-        )
-
-    top_low = top_hn_users_lowest_karma(users, posts, target_date)
-    if not top_low.empty:
-        top_low["date"] = target_date
-        top_low["ranking"] = "lowest"
-        _write_metric(bucket, top_low, "top_hn_users_by_karma", ["date", "ranking"])
-
-    # Top 10 jobs and posts
-    top_jobs = top_hn_jobs(posts, target_date)
-    if not top_jobs.empty:
-        top_jobs["date"] = target_date
-        written["top_hn_jobs"] = _write_metric(bucket, top_jobs, "top_hn_jobs", ["date"])
-
-    top_posts = top_hn_posts_by_score(posts, target_date)
-    if not top_posts.empty:
-        top_posts["date"] = target_date
-        written["top_hn_posts"] = _write_metric(bucket, top_posts, "top_hn_posts", ["date"])
-
-    return {
-        "date": target_date,
-        "silver_users_rows": len(users),
-        "silver_posts_rows": len(posts),
-        "silver_users_columns": list(users.columns),
-        "silver_posts_columns": list(posts.columns),
-        "gold_tables_written": written,
+    # Registration date is real account creation; followers/karma are observed snapshots.
+    users = users[users["created_at"].isna() |
+                  (pd.to_datetime(users["created_at"], utc=True).dt.strftime("%Y-%m-%d") <= target_date)]
+    highest = top_hn_users_highest_karma(users, posts, target_date).assign(ranking="highest")
+    lowest = top_hn_users_lowest_karma(users, posts, target_date).assign(ranking="lowest")
+    metrics = {
+        "daily_users_metric": daily_users_metric(users, target_date, posts),
+        "daily_hn_post_counts": daily_hn_post_counts(posts, target_date),
+        "data_quality_score": data_quality_score(users, posts),
+        "top_x_users_by_followers": top_x_users_by_followers(users, target_date),
+        "top_hn_users_by_karma": pd.concat([highest, lowest], ignore_index=True),
+        "top_hn_jobs": top_hn_jobs(posts, target_date),
+        "top_hn_posts": top_hn_posts_by_score(posts, target_date),
     }
-
+    prefix = f"s3://{bucket}/gold/runs/{uuid.uuid4().hex}"
+    tables, counts = {}, {}
+    for name, df in metrics.items():
+        counts[name] = len(df)
+        if df.empty:
+            tables[name] = None  # explicit empty result, never stale rows from an older run
+            continue
+        df["date"] = target_date
+        partitions = ["date"]
+        if "platform" in df:
+            partitions.insert(0, "platform")
+        if "ranking" in df:
+            partitions.append("ranking")
+        result = wr.s3.to_parquet(df=df, path=f"{prefix}/{name}/", dataset=True,
+                                 partition_cols=partitions, compression="snappy", mode="append")
+        tables[name] = result["paths"]
+    manifest = {"date": target_date, "tables": tables, "counts": counts, "status": "complete"}
+    boto3.client("s3").put_object(Bucket=bucket, Key=f"control/gold/{target_date}.json",
+                                Body=json.dumps(manifest).encode(), ContentType="application/json")
+    return {"date": target_date, "gold_tables_written": counts}
 
 def handler(event, context):
-    bucket = os.environ["DATA_BUCKET_NAME"]
-    target_date = event.get("date") or _previous_utc_day()
-    result = transform_gold(bucket, target_date)
-    return {
-        **result,
-        "request_id": context.aws_request_id,
-    }
+    day = event.get("date") or (datetime.now(timezone.utc).date()-timedelta(days=1)).isoformat()
+    return transform_gold(os.environ["DATA_BUCKET_NAME"], day)

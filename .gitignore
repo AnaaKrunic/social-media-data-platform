@@ -1,5 +1,6 @@
 # Python virtual environments and generated Python files
 .venv/
+.test-venv/
 venv/
 ENV/
 __pycache__/
@@ -19,6 +20,7 @@ htmlcov/
 # CDK generated assets and synthesized CloudFormation output
 .cdk.staging/
 cdk.out/
+cdk.out.*/
 
 # Local secrets and AWS key material - commit only safe example files
 .env

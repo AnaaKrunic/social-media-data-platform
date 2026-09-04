@@ -13,15 +13,18 @@ HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
 def strip_html(value: str | None) -> str:
     if not value:
         return ""
-    without_tags = HTML_TAG_PATTERN.sub("", value)
+    without_tags = HTML_TAG_PATTERN.sub(" ", value)
     return html.unescape(without_tags).strip()
 
 
 def epoch_to_iso8601(value: int | str | None) -> str | None:
     if value is None or value == "":
         return None
-    timestamp = datetime.fromtimestamp(int(value), tz=timezone.utc)
-    return timestamp.strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        timestamp = datetime.fromtimestamp(int(value), tz=timezone.utc)
+        return timestamp.strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (ValueError, TypeError, OverflowError, OSError):
+        return None
 
 
 def parse_datetime_to_iso8601(value: str | None) -> str | None:
@@ -31,6 +34,14 @@ def parse_datetime_to_iso8601(value: str | None) -> str | None:
     normalized = value.strip()
     if normalized.endswith("Z"):
         normalized = normalized[:-1] + "+00:00"
+
+    try:
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        pass
 
     for fmt in (
         "%Y-%m-%dT%H:%M:%S%z",
@@ -50,7 +61,7 @@ def parse_datetime_to_iso8601(value: str | None) -> str | None:
 
 def make_user_id(platform: str, username: str) -> str:
     """Deterministic UUID so re-runs do not create duplicate users."""
-    return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{platform}:{username.lower()}"))
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{platform}:{username}"))
 
 
 def partition_date_parts(iso_timestamp: str | None) -> tuple[str | None, str | None, str | None]:
